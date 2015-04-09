@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "./node_modules/.bin/forever start index.js && ./node_modules/.bin/forever list",
+    "start": "./node_modules/.bin/forever start -a index.js && ./node_modules/.bin/forever list",
     "stop": "./node_modules/.bin/forever stop index.js"
   },
   "author": "",
