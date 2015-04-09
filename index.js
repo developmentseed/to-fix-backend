@@ -4,6 +4,7 @@ var fs = require('fs'),
     boom = require('boom'),
     pg_copy = require('pg-copy-streams'),
     hstore = require('pg-hstore')(),
+    queue = require('queue-async'),
     reformatCsv = require('./lib/reformat-csv');
 
 var user = process.env.DBUsername || 'postgres';
@@ -82,28 +83,27 @@ server.route({
     handler: function(request, reply) {
         var table = request.params.task.replace(/[^a-zA-Z]+/g, '').toLowerCase();
 
-        client.query('SELECT count(*) FROM ' + table + ';', function(err, results) {
-            if (err) return reply(boom.badRequest(err));
-            var total = results.rows[0].count;
-
-            client.query('SELECT count(*) FROM ' + table + ' WHERE unixtime != 2147483647;', function(err, results) {
+        queue(1)
+            .defer(function(cb) {
+                // overall count
+                client.query('SELECT count(*) FROM ' + table + ';', cb);
+            })
+            .defer(function(cb) {
+                // unfixed items
+                client.query('SELECT count(*) FROM ' + table + ' WHERE time != 2147483647;', cb);
+            })
+            .defer(function(cb) {
+                // items that are active
+                client.query('SELECT count(*) from ' + table + ' WHERE time > ' + Math.round(+new Date()/1000) + ' AND time != 2147483647;' , cb);
+            })
+            .awaitAll(function(err, results) {
                 if (err) return reply(boom.badRequest(err));
-                var unfixed = results.rows[0].count;
-                var query = 'SELECT count(*) from ' + table + ' WHERE unixtime > ' + Math.round(+new Date()/1000) + ' AND unixtime != 2147483647;';
-                client.query(query, function(err, results) {
-                    if (err) return reply(boom.badRequest(err));
-                    var active = results.rows[0].count;
-
-                    reply({
-                        'total': parseInt(total),
-                        'available': parseInt(unfixed),
-                        'active': parseInt(active)
-                    });
-
+                reply({
+                    total: parseInt(results[0].rows[0].count),
+                    available: parseInt(results[1].rows[0].count),
+                    active: parseInt(results[2].rows[0].count)
                 });
             });
-        });
-
     }
 });
 
@@ -145,17 +145,17 @@ server.route({
         // gets results filtered by key:value or by date range
         // user:joey, filters from hstore
         // or
-        // from:2015-03-17/to:2015-03-19, filters on unixtime
+        // from:2015-03-17/to:2015-03-19, filters on time
 
         var table = request.params.task.replace(/[^a-zA-Z]+/g, '').toLowerCase();
-        var query = 'SELECT time AS unixtime, hstore_to_json_loose(attributes) AS attributes FROM ' + table + '_stats WHERE ';
+        var query = 'SELECT time AS time, hstore_to_json_loose(attributes) AS attributes FROM ' + table + '_stats WHERE ';
         var params;
 
         if (request.params.key == 'from' && request.params.to) {
             var from = Date.parse(request.params.value)/1000;
             var to = Date.parse(request.params.to.split(':')[1])/1000;
-            // if they are the same date, move the 'to' date ahead 24 hours
-            if (from == to) to = to + 86400;
+            // go to the end of the to date
+            to = to + 86400;
             query += 'time > $1 and time < $2;';
             params = [from, to];
         } else if (request.params.key == 'from' && !request.params.to) {
@@ -168,7 +168,7 @@ server.route({
         }
 
         client.query(query, params, function(err, results) {
-            if (err) return console.log(err);
+            if (err) return reply(boom.badRequest(err));
             reply({
                 updated: Math.round(+new Date()/1000),
                 data: results.rows
@@ -222,10 +222,10 @@ server.route({
     path: '/task/{task}',
     handler: function(request, reply) {
         var table = request.params.task.replace(/[^a-zA-Z]+/g, '').toLowerCase();
-        var query = 'UPDATE ' + table + ' x SET unixtime=$1 FROM (SELECT key, unixtime FROM ' + table + ' WHERE unixtime < $2 AND unixtime != 2147483647 ORDER BY unixtime ASC LIMIT 1) AS sub WHERE x.key=sub.key RETURNING x.key, x.value;';
+        var query = 'UPDATE ' + table + ' x SET time=$1 FROM (SELECT key, time FROM ' + table + ' WHERE time < $2 AND time != 2147483647 ORDER BY time ASC LIMIT 1) AS sub WHERE x.key=sub.key RETURNING x.key, x.value;';
         var now = Math.round(+new Date()/1000);
         client.query(query, [now+lockPeriod, now], function(err, results) {
-            if (err) return console.log(err);
+            if (err) return reply(boom.badRequest(err));
             return reply(JSON.stringify({
                 key: results.rows[0].key,
                 value: JSON.parse(results.rows[0].value.split('|').join('"'))
@@ -245,7 +245,7 @@ server.route({
     handler: function(request, reply) {
         var table = request.params.task.replace(/[^a-zA-Z]+/g, '').toLowerCase();
         // 2147483647 is int max
-        var query = 'UPDATE ' + table + ' SET unixtime=2147483647 WHERE key=$1;';
+        var query = 'UPDATE ' + table + ' SET time=2147483647 WHERE key=$1;';
         client.query(query, [request.payload.key], function(err, results) {
             if (err) return boom.badRequest(err);
             // check for a real update, err if not
@@ -337,49 +337,40 @@ server.route({
                                 return closed ? null : reply(boom.badRequest(err));
                             }
                             setTimeout(function() {
-                                // https://github.com/brianc/node-pg-copy-streams/issues/22
-                                client.query('ALTER TABLE temp_' + taskName + ' ADD COLUMN unixtime INT DEFAULT 0;', function(err, results) {
-                                    if (err) return reply(boom.badRequest(err));
-
-                                    client.query('CREATE TABLE ' + taskName + ' as SELECT * FROM temp_' + taskName + ' ORDER BY RANDOM();', function(err, results) {
+                                queue(1)
+                                    .defer(function(cb) {
+                                        client.query('ALTER TABLE temp_' + taskName + ' ADD COLUMN time INT DEFAULT 0;', cb);
+                                    })
+                                    .defer(function(cb) {
+                                        client.query('CREATE TABLE ' + taskName + ' as SELECT * FROM temp_' + taskName + ' ORDER BY RANDOM();', cb);
+                                    })
+                                    .defer(function(cb) {
+                                        client.query('CREATE INDEX CONCURRENTLY ON ' + taskName + ' (time);', cb);
+                                    })
+                                    .defer(function(cb) {
+                                        client.query('CREATE TABLE ' + taskName + '_stats (time INT, attributes HSTORE);', cb);
+                                    })
+                                    .defer(function(cb) {
+                                        client.query('CREATE INDEX CONCURRENTLY ON ' + taskName + '_stats (time);', cb);
+                                    })
+                                    .defer(function(cb) {
+                                        client.query('DROP TABLE temp_' + taskName + ';', cb);
+                                    })
+                                    .defer(function(cb) {
+                                        var details = {
+                                            title: '',
+                                            description: '',
+                                            updated: Math.round(+new Date()/1000),
+                                            owner: JSON.stringify([data.user || null])
+                                        };
+                                        client.query('INSERT INTO task_details VALUES($1, $2);', [taskName, hstore.stringify(details)], cb);
+                                    })
+                                    .awaitAll(function(err, results) {
                                         if (err) return reply(boom.badRequest(err));
-
-                                        // don't wait
-                                        client.query('CREATE INDEX CONCURRENTLY ON ' + taskName + ' (unixtime);', function(err, results) {
-                                            if (err) return console.log('taskName create index', err);
+                                        reply({
+                                            taskname: taskName
                                         });
-
-                                        client.query('CREATE TABLE ' + taskName + '_stats (time INT, attributes HSTORE);', function(err, results) {
-                                            if (err) return reply(boom.badRequest(err));
-
-                                            // don't wait
-                                            client.query('CREATE INDEX CONCURRENTLY ON ' + taskName + '_stats (time);', function(err, results) {
-                                                if (err) return ('_stats create index', err);
-                                            });
-
-                                            client.query('DROP TABLE temp_' + taskName + ';', function(err, results) {
-                                                if (err) return reply(boom.badRequest(err));
-
-                                                var details = {
-                                                    title: '',
-                                                    description: '',
-                                                    updated: Math.round(+new Date()/1000),
-                                                    owner: JSON.stringify([data.user || null])
-                                                };
-
-                                                client.query('INSERT INTO task_details VALUES($1, $2);', [taskName, hstore.stringify(details)], function(err, results) {
-                                                    if (err) return reply(boom.badRequest(err));
-                                                    return reply({
-                                                        taskName: taskName
-                                                    });
-                                                });
-
-                                            });
-
-                                        });
-
                                     });
-                                });
                             }, 500);
                         }
 
