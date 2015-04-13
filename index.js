@@ -309,15 +309,7 @@ server.route({
                     } else {
                         var closed = 0;
 
-                        queue(1)
-                        .defer(function(cb) {
-                            // Drop temp before creating one.
-                            client.query('DROP TABLE IF EXISTS temp_' + taskName, cb);
-                        })
-                        .defer(function(cb) {
-                            client.query('CREATE TABLE temp_' + taskName + ' (key VARCHAR(255), value TEXT);', cb);
-                        })
-                        .awaitAll(function(err, results) {
+                        client.query('CREATE TABLE temp_' + taskName + ' (key VARCHAR(255), value TEXT);', function(err, res) {
                             if (err) return reply(boom.badRequest(err));
 
                             var stream = client.query(pg_copy.from('COPY temp_' + taskName + ' FROM STDIN (FORMAT CSV);'));
@@ -333,6 +325,10 @@ server.route({
                                     .on('finish', theEnd)
                                     .on('error', theEnd);
                         });
+
+                        function rmTempTable(taskName, cb) {
+                            client.query('DROP TABLE IF EXISTS temp_' + taskName, cb);
+                        }
 
                         // do this because on error both will emit something and calling reply twice errors
                         function theEnd(err) {
@@ -383,11 +379,15 @@ server.route({
                                         });
                                     }
 
-                                    q.defer(function(cb) {
-                                        client.query('DROP TABLE temp_' + taskName + ';', cb);
-                                    })
-                                    .awaitAll(function(err, results) {
+                                    q.awaitAll(function(err, results) {
+                                        // Always remove the temp table at the end.
+                                        // Even if there's an error.
+                                        rmTempTable(taskName, function(err, res) {
+
+                                        });
+
                                         if (err) {
+                                            // Duplicate key.
                                             if (err.code == 23505) {
                                                 return reply(boom.badRequest(err.toString() + ' - ' + err.detail));
                                             }
